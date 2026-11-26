@@ -30,6 +30,7 @@ cfg: Config
 db: DB
 ai: DeepSeek
 emoji: PremiumEmoji
+_last_refresh = 0.0
 _locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
@@ -51,12 +52,24 @@ def after_answer_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def refresh_shared_state() -> None:
+    """В serverless несколько инстансов: раз в минуту подтягиваем эмодзи и статус админа из БД."""
+    global _last_refresh
+    if time.monotonic() - _last_refresh < 60:
+        return
+    _last_refresh = time.monotonic()
+    emoji.clear()
+    emoji.update(await db.load_emoji())
+    _sync_emoji_mode((await db.get_meta("admin_premium")) == "1")
+
+
 # ---------- доступ ----------
 @router.message.outer_middleware()
 async def access_mw(handler, event: Message, data):
     user = event.from_user
     if not user or event.chat.type != "private":
         return
+    await refresh_shared_state()
     if user.id in cfg.admin_ids and user.is_premium is not None:
         await db.set_meta("admin_premium", "1" if user.is_premium else "0")
         _sync_emoji_mode(user.is_premium)
@@ -69,6 +82,7 @@ async def access_mw(handler, event: Message, data):
 
 @router.callback_query.outer_middleware()
 async def access_cb_mw(handler, event: CallbackQuery, data):
+    await refresh_shared_state()
     if not cfg.is_allowed(event.from_user.id):
         return await event.answer("Нет доступа", show_alert=True)
     return await handler(event, data)

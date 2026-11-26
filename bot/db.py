@@ -1,130 +1,121 @@
+"""Хранилище на Supabase (PostgREST через httpx — без драйверов и пулов соединений, удобно для serverless)."""
 from __future__ import annotations
 
-import os
+import random
 
-import aiosqlite
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS messages(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id INTEGER NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    ts DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, id);
-CREATE TABLE IF NOT EXISTS users(
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    role TEXT DEFAULT 'assistant',
-    model TEXT DEFAULT 'chat',
-    requests INTEGER DEFAULT 0,
-    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS emoji(plain TEXT PRIMARY KEY, custom_id TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
-"""
+import httpx
 
 
 class DB:
-    def __init__(self, path: str):
-        self.path = path
-        self.conn: aiosqlite.Connection
-
-    async def init(self) -> None:
-        if os.path.dirname(self.path):
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        self.conn = await aiosqlite.connect(self.path)
-        await self.conn.executescript(SCHEMA)
-        await self.conn.commit()
+    def __init__(self, url: str, key: str):
+        self.http = httpx.AsyncClient(
+            base_url=url.rstrip("/") + "/rest/v1",
+            headers={"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            timeout=15,
+        )
 
     async def close(self) -> None:
-        await self.conn.close()
+        await self.http.aclose()
+
+    async def _req(self, method: str, path: str, *, prefer: str | None = None, **kw) -> httpx.Response:
+        headers = {"Prefer": prefer} if prefer else None
+        r = await self.http.request(method, path, headers=headers, **kw)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Supabase {method} {path}: {r.status_code} {r.text[:300]}")
+        return r
+
+    async def _upsert(self, table: str, rows: list[dict], conflict: str) -> None:
+        await self._req(
+            "POST", f"/{table}", params={"on_conflict": conflict}, json=rows,
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+    # --- дедупликация webhook-ов ---
+    async def claim_update(self, update_id: int) -> bool:
+        r = await self._req(
+            "POST", "/processed_updates", params={"on_conflict": "update_id"}, json=[{"update_id": update_id}],
+            prefer="resolution=ignore-duplicates,return=representation",
+        )
+        if random.random() < 0.02:  # изредка чистим старое
+            await self._req("DELETE", "/processed_updates", params={"created_at": "lt." + _ago()})
+        return bool(r.json())
 
     # --- пользователи ---
     async def touch_user(self, user_id: int, name: str) -> tuple[str, str]:
-        await self.conn.execute(
-            "INSERT INTO users(user_id, name) VALUES(?, ?) ON CONFLICT(user_id) DO UPDATE SET name=excluded.name",
-            (user_id, name),
-        )
-        await self.conn.commit()
+        await self._upsert("users", [{"user_id": user_id, "name": name}], "user_id")
         return await self.user_settings(user_id)
 
     async def user_settings(self, user_id: int) -> tuple[str, str]:
-        cur = await self.conn.execute("SELECT role, model FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        return (row[0], row[1]) if row else ("assistant", "chat")
+        r = await self._req("GET", "/users", params={"user_id": f"eq.{user_id}", "select": "role,model"})
+        rows = r.json()
+        return (rows[0]["role"], rows[0]["model"]) if rows else ("assistant", "chat")
+
+    async def _patch_user(self, user_id: int, data: dict) -> None:
+        await self._req("PATCH", "/users", params={"user_id": f"eq.{user_id}"}, json=data, prefer="return=minimal")
 
     async def set_role(self, user_id: int, role: str) -> None:
-        await self.conn.execute("UPDATE users SET role=? WHERE user_id=?", (role, user_id))
-        await self.conn.commit()
+        await self._patch_user(user_id, {"role": role})
 
     async def set_model(self, user_id: int, model: str) -> None:
-        await self.conn.execute("UPDATE users SET model=? WHERE user_id=?", (model, user_id))
-        await self.conn.commit()
+        await self._patch_user(user_id, {"model": model})
 
     async def count_request(self, user_id: int) -> None:
-        await self.conn.execute("UPDATE users SET requests=requests+1 WHERE user_id=?", (user_id,))
-        await self.conn.commit()
+        await self._req("POST", "/rpc/increment_requests", json={"p_user_id": user_id})
 
     async def stats(self) -> tuple[int, int, int]:
-        users = (await (await self.conn.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        reqs = (await (await self.conn.execute("SELECT COALESCE(SUM(requests),0) FROM users")).fetchone())[0]
-        msgs = (await (await self.conn.execute("SELECT COUNT(*) FROM messages")).fetchone())[0]
-        return users, reqs, msgs
+        d = (await self._req("POST", "/rpc/bot_stats", json={})).json()
+        return d["users"], d["requests"], d["messages"]
 
     # --- история ---
     async def history(self, chat_id: int, limit: int) -> list[dict]:
-        cur = await self.conn.execute(
-            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit)
+        r = await self._req(
+            "GET", "/messages",
+            params={"chat_id": f"eq.{chat_id}", "select": "role,content", "order": "id.desc", "limit": limit},
         )
-        rows = await cur.fetchall()
-        return [{"role": r, "content": c} for r, c in reversed(rows)]
+        return list(reversed(r.json()))
 
     async def add_messages(self, chat_id: int, *pairs: tuple[str, str]) -> None:
-        await self.conn.executemany(
-            "INSERT INTO messages(chat_id, role, content) VALUES(?,?,?)", [(chat_id, r, c) for r, c in pairs]
+        await self._req(
+            "POST", "/messages", json=[{"chat_id": chat_id, "role": r, "content": c} for r, c in pairs],
+            prefer="return=minimal",
         )
-        await self.conn.commit()
 
     async def pop_last_exchange(self, chat_id: int) -> str | None:
-        """Удаляет последний ответ ассистента и возвращает последний вопрос юзера (тоже удаляя его)."""
-        cur = await self.conn.execute(
-            "SELECT id, role, content FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 2", (chat_id,)
+        r = await self._req(
+            "GET", "/messages",
+            params={"chat_id": f"eq.{chat_id}", "select": "id,role,content", "order": "id.desc", "limit": 2},
         )
-        rows = await cur.fetchall()
-        if len(rows) < 2 or rows[0][1] != "assistant" or rows[1][1] != "user":
+        rows = r.json()
+        if len(rows) < 2 or rows[0]["role"] != "assistant" or rows[1]["role"] != "user":
             return None
-        await self.conn.execute("DELETE FROM messages WHERE id IN (?, ?)", (rows[0][0], rows[1][0]))
-        await self.conn.commit()
-        return rows[1][2]
+        ids = ",".join(str(x["id"]) for x in rows)
+        await self._req("DELETE", "/messages", params={"id": f"in.({ids})"})
+        return rows[1]["content"]
 
     async def clear(self, chat_id: int) -> None:
-        await self.conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
-        await self.conn.commit()
+        await self._req("DELETE", "/messages", params={"chat_id": f"eq.{chat_id}"})
 
     # --- эмодзи / meta ---
     async def load_emoji(self) -> dict[str, str]:
-        cur = await self.conn.execute("SELECT plain, custom_id FROM emoji")
-        return {p: c for p, c in await cur.fetchall()}
+        r = await self._req("GET", "/emoji", params={"select": "plain,custom_id", "limit": 5000})
+        return {x["plain"]: x["custom_id"] for x in r.json()}
 
     async def save_emoji(self, mapping: dict[str, str]) -> None:
-        await self.conn.executemany(
-            "INSERT INTO emoji(plain, custom_id) VALUES(?,?) ON CONFLICT(plain) DO UPDATE SET custom_id=excluded.custom_id",
-            list(mapping.items()),
-        )
-        await self.conn.commit()
+        await self._upsert("emoji", [{"plain": p, "custom_id": c} for p, c in mapping.items()], "plain")
 
     async def clear_emoji(self) -> None:
-        await self.conn.execute("DELETE FROM emoji")
-        await self.conn.commit()
+        await self._req("DELETE", "/emoji", params={"plain": "not.is.null"})
 
     async def get_meta(self, key: str) -> str | None:
-        row = await (await self.conn.execute("SELECT value FROM meta WHERE key=?", (key,))).fetchone()
-        return row[0] if row else None
+        r = await self._req("GET", "/meta", params={"key": f"eq.{key}", "select": "value"})
+        rows = r.json()
+        return rows[0]["value"] if rows else None
 
     async def set_meta(self, key: str, value: str) -> None:
-        await self.conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)
-        )
-        await self.conn.commit()
+        await self._upsert("meta", [{"key": key, "value": value}], "key")
+
+
+def _ago() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()

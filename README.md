@@ -1,38 +1,31 @@
-# DeepSeek Telegram Bot
+# DeepSeek Telegram Bot (Vercel + Supabase)
 
-Полноценный ИИ-бот для Telegram на **DeepSeek API** (aiogram 3).
+ИИ-бот для Telegram на **DeepSeek API**: стриминг ответов, красивое оформление, память диалога,
+роли, режим рассуждений и премиум-эмодзи. Работает на Vercel (webhook), данные — в Supabase.
 
-## Возможности
-- 💬 Диалог с памятью (SQLite), `/new` — сброс
-- ⚡ Стриминг ответа в реальном времени (живое редактирование сообщения)
-- 🎨 Красивое оформление: Markdown → Telegram HTML (жирный/курсив, списки, заголовки, цитаты, ссылки, код с подсветкой, таблицы)
-- ✂️ Длинные ответы режутся на сообщения, не ломая блоки кода
-- 🎭 `/role` — 6 ролей (ассистент, программист, копирайтер, переводчик, учитель, аналитик)
-- 🧠 `/model` — быстрая `deepseek-chat` или думающая `deepseek-reasoner`
-- 🔄 Кнопки «Заново» и «Новый диалог» под ответом
-- 🔒 Белый список пользователей, админы
-- 💎 Премиум-эмодзи (см. ниже)
+## Деплой
+1. **Supabase** → New project → SQL Editor → вставь и выполни `supabase/schema.sql`.
+   Ключи: Project Settings → API → `Project URL` и `service_role` key.
+2. **Telegram**: создай бота в @BotFather, возьми токен. Свой ID узнай у @userinfobot.
+3. **Vercel** → Add New Project → импортируй этот репозиторий → в Environment Variables добавь
+   переменные из `.env.example` (обязательные: `TELEGRAM_BOT_TOKEN`, `DEEPSEEK_API_KEY`,
+   `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`, `WEBHOOK_SECRET`; рекомендуется `ADMIN_IDS`) → Deploy.
+4. Открой в браузере один раз:
+   `https://<твой-проект>.vercel.app/api/setup?secret=<WEBHOOK_SECRET>`
+   — установит webhook и меню команд. Напиши боту `/start`.
 
-## Запуск
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # TELEGRAM_BOT_TOKEN от @BotFather, DEEPSEEK_API_KEY с platform.deepseek.com
-python -m bot.main
-```
-или `docker compose up -d --build`.
+> `maxDuration` в `vercel.json` = 300 с (нужен Fluid Compute, включён по умолчанию на новых проектах).
+> На старом Hobby-плане лимит 60 с — поставь 60, если деплой ругнётся.
 
 ## Премиум-эмодзи
-Бот заменяет обычные эмодзи (и в интерфейсе, и в ответах ИИ) на кастомные через `<tg-emoji>`.
-1. Укажи свой Telegram ID в `ADMIN_IDS`.
-2. Отправь боту `/emojipack https://t.me/addemoji/НазваниеНабора` — все эмодзи набора привяжутся
-   к своим обычным аналогам и сохранятся в БД.
-3. `PREMIUM_EMOJI=auto` — включаются, когда админ с Telegram Premium напишет боту
-   (`on`/`off` — принудительно). Статус смотри в `/status`.
+1. `ADMIN_IDS` = твой Telegram ID.
+2. Боту: `/emojipack https://t.me/addemoji/НазваниеНабора` — эмодзи набора привяжутся к обычным.
+3. `PREMIUM_EMOJI=auto` включит их, когда админ с Telegram Premium напишет боту (`on`/`off` — принудительно).
+Если Telegram не разрешит — увидишь обычные эмодзи, ничего не ломается. Статус: `/status`.
 
-Если Telegram не разрешит боту кастомные эмодзи, пользователь увидит обычные — ничего не ломается.
-Помощники: `/emojiid` (ответом на сообщение с эмодзи покажет id), `/emojireset`.
-
-## Тесты
+## Локальная разработка
 ```bash
+pip install -r requirements.txt && cp .env.example .env
+python -m bot.main        # long polling (сам снимет webhook)
 pip install -r requirements-dev.txt && pytest
 ```
